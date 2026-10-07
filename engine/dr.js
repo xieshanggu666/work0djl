@@ -1,4 +1,6 @@
 "use strict";
+const fs = require("fs");
+const path = require("path");
 const tariff = require("./tariff");
 const sim = require("./sim");
 
@@ -10,7 +12,9 @@ const sim = require("./sim");
 // 关键不变式：
 //   1. 激励只改变调度信号价，真实分时电价仍是唯一能量结算口径，旧账单不变；
 //   2. 同一 (home,event) 的执行/月账单结算只入账一次，撤销/失败不重复结算；
-//   3. 计划撤销后尚未执行的报名作废，已结算的奖励不回滚（历史按事实留存）。
+//   3. 计划撤销后尚未执行的报名作废，已结算的奖励不回滚（历史按事实留存）；
+//   4. 台账每次变更后原子落盘，服务重启从快照恢复：旧账单、撤销计划、失败
+//      与已结算记录原样找回，重复执行/重复出账仍只回读首笔，不重复发奖励。
 
 function r2(x) {
   return Math.round(x * 100) / 100;
@@ -152,12 +156,125 @@ function measureWithSignal(opts, eventLike, sig, carrySoc, endValue) {
 
 // ------------------------------- 台账存储 ----------------------------------
 
-function createStore() {
+const SNAPSHOT_VERSION = 1;
+
+// 原子写文件：先写临时文件并 fsync，再 rename 覆盖目标。
+// 任何时刻崩溃，目标文件要么是上一份完整快照、要么是新快照，不会出现半截 JSON。
+function writeAtomic(file, data) {
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+  const fd = fs.openSync(tmp, "w");
+  try {
+    fs.writeSync(fd, data, 0, "utf8");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, file);
+  // 目录项变更也需落盘，否则 rename 本身可能在宕机后丢失
+  try {
+    const dfd = fs.openSync(dir, "r");
+    try { fs.fsyncSync(dfd); } finally { fs.closeSync(dfd); }
+  } catch (_) { /* 个别平台不允许 fsync 目录，忽略 */ }
+}
+
+// 校验快照条目形状：损坏/陌生格式直接拒绝启动，绝不静默丢记录
+function assertObject(v, where) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) {
+    throw new Error(`DR 台账快照损坏：${where} 必须是对象`);
+  }
+}
+
+function createStore(options) {
+  const opts = typeof options === "string" ? { file: options } : (options || {});
+  const file = opts.file || null;
   const plans = new Map();     // planId -> plan（含 events[]）
   const enrollments = new Map(); // `${homeId}${planId}` -> {homeId, planId, at, status}
   const executions = new Map();  // `${homeId}${eventKey}` -> 执行结果（幂等，冻结）
   const settlements = new Map(); // 结算幂等键 -> 结算记录
   let planSeq = 0;
+  let restored = false;
+  let restoredAt = null;
+
+  // 生成全量快照（Map 以 [key, value] 数组保存，键即幂等键，恢复时原样重建）
+  function snapshot() {
+    return {
+      version: SNAPSHOT_VERSION,
+      saved_at: new Date().toISOString(),
+      planSeq,
+      plans: [...plans.entries()],
+      enrollments: [...enrollments.entries()],
+      executions: [...executions.entries()],
+      settlements: [...settlements.entries()],
+    };
+  }
+
+  // 每次状态变更后落盘；内存模式（file=null）为空操作。
+  // 同步写 + 原子 rename：崩溃后重启读到的永远是一份完整台账。
+  function persist() {
+    if (!file) return;
+    writeAtomic(file, JSON.stringify(snapshot()));
+  }
+
+  // 从快照重建台账
+  function load() {
+    if (!file || !fs.existsSync(file)) return;
+    let raw;
+    try {
+      raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (e) {
+      throw new Error(`DR 台账快照 ${file} 无法解析（${e.message}），为避免丢记录拒绝启动`);
+    }
+    assertObject(raw, "快照根");
+    if (raw.version !== SNAPSHOT_VERSION) {
+      throw new Error(`DR 台账快照版本 ${raw.version} 不受支持（当前 v${SNAPSHOT_VERSION}），拒绝启动`);
+    }
+    if (!Number.isInteger(raw.planSeq) || raw.planSeq < 0) {
+      throw new Error("DR 台账快照损坏：planSeq 非法");
+    }
+    function loadEntries(arr, name) {
+      if (!Array.isArray(arr)) throw new Error(`DR 台账快照损坏：${name} 必须是数组`);
+      const out = new Map();
+      for (const pair of arr) {
+        if (!Array.isArray(pair) || pair.length !== 2 || typeof pair[0] !== "string") {
+          throw new Error(`DR 台账快照损坏：${name} 条目非法`);
+        }
+        assertObject(pair[1], `${name}[${pair[0]}]`);
+        out.set(pair[0], pair[1]);
+      }
+      return out;
+    }
+    const p = loadEntries(raw.plans, "plans");
+    const en = loadEntries(raw.enrollments, "enrollments");
+    const ex = loadEntries(raw.executions, "executions");
+    const st = loadEntries(raw.settlements, "settlements");
+    // 完整性交叉校验：报名/执行引用的计划必须存在，防止拼出半套台账
+    for (const rec of en.values()) {
+      if (typeof rec.homeId !== "string" || typeof rec.planId !== "string" || !p.has(rec.planId)) {
+        throw new Error(`DR 台账快照损坏：报名记录 ${rec.homeId}/${rec.planId} 找不到对应计划`);
+      }
+    }
+    for (const rec of ex.values()) {
+      if (typeof rec.homeId !== "string" || !p.has(rec.planId)) {
+        throw new Error("DR 台账快照损坏：执行记录找不到对应计划");
+      }
+    }
+    for (const k of st.keys()) {
+      if (typeof k !== "string" || !(k.startsWith("exec:") || k.startsWith("month:"))) {
+        throw new Error(`DR 台账快照损坏：结算键 ${k} 非法`);
+      }
+    }
+    for (const [k, v] of p) plans.set(k, v);
+    for (const [k, v] of en) enrollments.set(k, v);
+    for (const [k, v] of ex) executions.set(k, v);
+    for (const [k, v] of st) settlements.set(k, v);
+    planSeq = raw.planSeq;
+    restored = true;
+    restoredAt = raw.saved_at || null;
+  }
+
+  load();
 
   function planKeyOf(ev) {
     return `${ev.year || ev.monthYear}-${ev.month}-p${ev.planId}`;
@@ -214,6 +331,7 @@ function createStore() {
       created_at: new Date().toISOString(),
     };
     plans.set(id, plan);
+    persist();
     return publicPlan(plan);
   }
 
@@ -245,6 +363,7 @@ function createStore() {
     for (const en of enrollments.values()) {
       if (en.planId === planId && en.status === "enrolled") en.status = "revoked";
     }
+    persist(); // 计划状态翻转本身必须落盘（即使当时没有报名记录）
     return publicPlan(plan);
   }
 
@@ -257,13 +376,16 @@ function createStore() {
     if (enrollments.has(k)) return enrollments.get(k);
     const en = { homeId, planId, status: "enrolled", at: new Date().toISOString() };
     enrollments.set(k, en);
+    persist();
     return { ...en };
   }
   function unenroll(homeId, planId) {
     const k = enKey(homeId, planId);
     const en = enrollments.get(k);
     if (!en) return { homeId, planId, status: "none" };
+    if (en.status === "withdrawn") return { ...en };
     en.status = "withdrawn";
+    persist();
     return { ...en };
   }
   function isEnrolled(homeId, planId) {
@@ -317,12 +439,14 @@ function createStore() {
     const existed = executions.get(k);
     if (existed) return { record: existed, reused: true };
     executions.set(k, rec);
+    persist();
     return { record: rec, reused: false };
   }
 
   function settle(key, record) {
     if (settlements.has(key)) return { record: settlements.get(key), reused: true };
     settlements.set(key, record);
+    persist();
     return { record, reused: false };
   }
   function getSettlement(key) {
@@ -359,17 +483,41 @@ function createStore() {
     return out.sort((a, b) => a.day - b.day);
   }
 
+  // 台账持久化与计数状态（供运维确认重启后是否成功恢复）
+  function stats() {
+    return {
+      file: file || null,
+      restored,
+      restored_at: restoredAt,
+      planSeq,
+      plans: plans.size,
+      enrollments: enrollments.size,
+      executions: executions.size,
+      settlements: settlements.size,
+    };
+  }
+
   return {
     publishPlan, getPlan, listPlans, revokePlan,
     enroll, unenroll, isEnrolled, listEnrollments,
     activeEventMap, monthlyEvents, findDayEvent,
     getExecution, freezeExecution,
     settle, getSettlement,
+    snapshot, stats,
   };
 }
 
-// 单例台账（进程内持久，随服务生命周期）
-const store = createStore();
+// 单例台账：默认落盘（data/dr-store.json），服务重启后计划/报名/执行/结算
+// 全部从快照恢复。可用环境变量覆盖：
+//   DR_STORE_FILE=/path/to.json  指定台账文件；
+//   DR_STORE_FILE=memory         强制纯内存（旧行为，不持久化）。
+const DEFAULT_STORE_FILE = path.join(__dirname, "..", "data", "dr-store.json");
+function defaultStoreFile() {
+  const v = process.env.DR_STORE_FILE;
+  if (v === "memory" || v === "none" || v === "off") return null;
+  return v || DEFAULT_STORE_FILE;
+}
+const store = createStore({ file: defaultStoreFile() });
 
 // 执行一次 DR 事件（运营方/家庭预演或事件结算用）：
 //   - 同一 (home, event) 重复执行返回首次冻结结果，不重复结算；
@@ -381,15 +529,18 @@ function runEvent(homeId, input, storeIn) {
   const body = input || {};
   const plan = S.getPlan(body.planId);
   if (!plan) throw new Error(`计划 ${body.planId} 不存在`);
-  if (!S.isEnrolled(homeId, body.planId)) {
-    throw new Error(`家庭 ${homeId} 未报名该计划或报名已失效`);
-  }
   const day = Number(body.day);
   const ev = plan.events.find(e => e.day === day);
   if (!ev) throw new Error(`计划 ${body.planId} 在 ${day} 日无 DR 事件`);
 
+  // 已冻结的执行结果是历史事实：即使随后计划撤销/家庭退出，甚至服务重启后，
+  // 重复调用也必须回读首笔（含 failed），不能再走报名校验、不能重复结算。
   const existed = S.getExecution(homeId, ev);
   if (existed) return { ...existed, idempotent: true };
+
+  if (!S.isEnrolled(homeId, body.planId)) {
+    throw new Error(`家庭 ${homeId} 未报名该计划或报名已失效`);
+  }
 
   const opts = body.household || {};
   const seed = body.seed == null ? 11 : body.seed;

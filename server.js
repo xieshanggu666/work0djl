@@ -60,6 +60,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/dr/plans" && req.method === "GET") {
       return json(res, 200, { plans: dr.store.listPlans() });
     }
+    // 台账持久化状态：重启后可据此确认计划/报名/结算是否已从快照恢复
+    if (p === "/api/dr/status" && req.method === "GET") {
+      return json(res, 200, { store: dr.store.stats() });
+    }
     // 撤销计划（GET 仅查询）
     if (p.startsWith("/api/dr/plans/") && p.endsWith("/revoke") && req.method === "POST") {
       const planId = decodeURIComponent(p.slice("/api/dr/plans/".length, -"/revoke".length));
@@ -145,5 +149,15 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, "127.0.0.1", () => {
+  const s = dr.store.stats();
+  if (s.file) {
+    console.log(
+      s.restored
+        ? `DR 台账已从快照恢复：${s.file}（快照时间 ${s.restored_at || "未知"}，计划 ${s.plans} / 报名 ${s.enrollments} / 执行 ${s.executions} / 结算 ${s.settlements}）`
+        : `DR 台账文件 ${s.file} 不存在，已新建空台账`
+    );
+  } else {
+    console.log("DR 台账为纯内存模式（重启不保留）");
+  }
   console.log(`home-energy running at http://127.0.0.1:${PORT}`);
 });
