@@ -185,10 +185,16 @@ function monthBill(opts) {
     // 日终残值取当日谷价：残余电量次日可按谷电回补
     const residual = Math.min.apply(null, tariff.hourlyPrices(o.tou));
     const ctxListAll = drStore ? drStore.findDayEvent(homeId, year, month, d) : null;
-    // 参与联动调度的事件：报名仍有效，或已成功执行（撤销不影响已结算事实）
+    // 参与联动调度的事件：报名仍有效；或此前已经按事实入账——独立执行成功冻结，
+    // 或月账单链路已成功结算过一笔（键为"账期+家庭+事件"）。后两者是历史事实：
+    // 即使计划随后撤销/家庭随后退出，重跑账单也必须仍按信号联动并回读冻结金额，
+    // 否则撤销操作会把已发奖励抹成 0（旧账单对不上、与"已结算不回滚"不变式冲突）。
     const ctxList = (ctxListAll || []).filter(ctx => {
+      if (ctx.active) return true;
       const ex = drStore.getExecution(homeId, ctx.ev);
-      return ctx.active || (ex && ex.status === "settled");
+      if (ex && ex.status === "settled") return true;
+      const ms = drStore.getMonthSettlement && drStore.getMonthSettlement(homeId, monthKey, ctx.ev);
+      return !!(ms && ms.result && ms.result.status === "settled");
     });
     const respond = ctxList.length > 0;
 
@@ -196,7 +202,8 @@ function monthBill(opts) {
     let m = null;
     let drRecs = [];
     if (respond) {
-      // 同日多事件信号合并（削峰取高、填谷取低；冲突时报错）
+      // 同日多事件信号合并（削峰取高、填谷取低；冲突时报错）。
+      // 信号只叠加"参与联动"的事件（生效中或已按事实入账）。
       const merged = drMod.mergeSignals(tariff.hourlyPrices(o.tou), ctxList.map(c => c.ev));
       const dayEventMerged = {
         type: "composite",
@@ -205,8 +212,9 @@ function monthBill(opts) {
       // 基线 vs 合并响应：响应量与能量差按合并窗口整体测算
       m = drMod.measureWithSignal(dayOpts, dayEventMerged, merged, carrySocKwh, residual);
       r = m.response;
-      // 逐事件结算：按各自窗口从基线/响应逐时曲线归因；冻结奖励以台账为准
-      for (const ctx of ctxList) {
+      // 逐事件结算全部上下文：参与者按信号归因并（或回读冻结金额）；
+      // 撤销/退出/失败分支不使用 m 的曲线，仅补齐台账，不产生第二笔成功结算。
+      for (const ctx of ctxListAll) {
         const rec = drMod.settleMonthDay(drStore, homeId, monthKey, d, ctx, m);
         drRecs.push(rec);
       }

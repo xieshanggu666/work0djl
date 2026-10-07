@@ -60,6 +60,10 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/dr/plans" && req.method === "GET") {
       return json(res, 200, { plans: dr.store.listPlans() });
     }
+    // 台账持久化状态：确认快照文件、最后落盘时间与各表条数（重启对账用）
+    if (p === "/api/dr/persistence" && req.method === "GET") {
+      return json(res, 200, dr.store.persistenceInfo());
+    }
     // 撤销计划（GET 仅查询）
     if (p.startsWith("/api/dr/plans/") && p.endsWith("/revoke") && req.method === "POST") {
       const planId = decodeURIComponent(p.slice("/api/dr/plans/".length, -"/revoke".length));

@@ -1,6 +1,12 @@
 "use strict";
+const fs = require("fs");
+const path = require("path");
 const tariff = require("./tariff");
 const sim = require("./sim");
+
+// 台账快照版本：恢复时只接受同版本，版本不符直接拒绝启动（宁可起不来，不可错账）
+const PERSIST_VERSION = 1;
+const DEFAULT_STORE_FILE = path.join(__dirname, "..", "data", "dr-store.json");
 
 // 电网需求响应（Demand Response）：
 // 运营方发布峰段削峰 / 谷段填谷激励计划，家庭报名后，事件当日可迁移家电与
@@ -10,7 +16,11 @@ const sim = require("./sim");
 // 关键不变式：
 //   1. 激励只改变调度信号价，真实分时电价仍是唯一能量结算口径，旧账单不变；
 //   2. 同一 (home,event) 的执行/月账单结算只入账一次，撤销/失败不重复结算；
-//   3. 计划撤销后尚未执行的报名作废，已结算的奖励不回滚（历史按事实留存）。
+//   3. 计划撤销（或家庭退出）只作废尚未结算的报名；已冻结的执行结果与已入账的
+//      月账单结算都是历史事实，不回滚——撤销后重跑账单仍回读同一笔；
+//   4. 服务单例台账原子落盘（data/dr-store.json，可用 DR_STORE_FILE 覆盖），
+//      重启后计划/报名/冻结结果/幂等键完整恢复；快照损坏或版本不符拒绝启动，
+//      绝不静默清空（清空即丢失幂等键，会造成重复发奖励）。
 
 function r2(x) {
   return Math.round(x * 100) / 100;
@@ -152,12 +162,105 @@ function measureWithSignal(opts, eventLike, sig, carrySoc, endValue) {
 
 // ------------------------------- 台账存储 ----------------------------------
 
-function createStore() {
+// 月账单链路的结算幂等键：参与调度判定与结算入账必须使用同一把键
+function monthSettleKey(homeId, monthKey, ev) {
+  return `month:${monthKey}:${homeId}:${ev.eventKey}`;
+}
+
+// 台账存储。opts:
+//   persistFile  持久化快照文件路径；缺省 / false 表示纯内存（测试与库内嵌入用）。
+//                服务进程的单例显式指定 DEFAULT_STORE_FILE，重启后从该文件恢复。
+// 每次变更后把完整台账原子写盘（临时文件 + rename），服务重启时完整恢复，
+// 冻结记录与幂等键随之恢复：旧账单照旧、撤销状态照旧、结算不重复入账。
+function createStore(optsIn) {
+  const opts = optsIn || {};
+  const persistFile = opts.persistFile ? opts.persistFile : null;
   const plans = new Map();     // planId -> plan（含 events[]）
   const enrollments = new Map(); // `${homeId}${planId}` -> {homeId, planId, at, status}
   const executions = new Map();  // `${homeId}${eventKey}` -> 执行结果（幂等，冻结）
   const settlements = new Map(); // 结算幂等键 -> 结算记录
   let planSeq = 0;
+
+  function snapshot(savedAt) {
+    return {
+      kind: "home-energy-dr-store",
+      version: PERSIST_VERSION,
+      saved_at: savedAt,
+      planSeq,
+      plans: [...plans.values()],
+      enrollments: [...enrollments.entries()].map(([k, v]) => ({ key: k, value: v })),
+      executions: [...executions.entries()].map(([k, v]) => ({ key: k, value: v })),
+      settlements: [...settlements.entries()].map(([k, v]) => ({ key: k, value: v })),
+    };
+  }
+
+  // 原子写盘：先写同目录临时文件再 rename，进程崩溃 / 断电时要么是旧文件要么是新文件，
+  // 不会留下半个 JSON 让恢复环节静默清空台账（清空会导致重复发奖励）。
+  function persist() {
+    if (!persistFile) return;
+    const payload = JSON.stringify(snapshot(new Date().toISOString()));
+    fs.mkdirSync(path.dirname(persistFile), { recursive: true });
+    const tmp = `${persistFile}.tmp-${process.pid}`;
+    fs.writeFileSync(tmp, payload);
+    fs.renameSync(tmp, persistFile);
+  }
+
+  // 从磁盘恢复：键原样回填（不依赖键拼接规则重新推导，避免规则演进后对不上账）。
+  // 文件损坏 / 版本不符一律抛错拒绝启动——旧文件保留在原处供人工核对，
+  // 绝不能静默重置成空台账，否则冻结的幂等键丢失会造成重复结算。
+  function load() {
+    if (!persistFile) return;
+    let raw;
+    try {
+      raw = fs.readFileSync(persistFile, "utf8");
+    } catch (e) {
+      if (e.code === "ENOENT") return; // 首次启动，空台账
+      throw e;
+    }
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      throw new Error(`DR 台账快照 ${persistFile} 已损坏，拒绝在可能丢记录的情况下启动；请人工核对后再恢复：${e.message}`);
+    }
+    if (!data || data.kind !== "home-energy-dr-store" || data.version !== PERSIST_VERSION) {
+      throw new Error(`DR 台账快照 ${persistFile} 版本或类型不符（期望 v${PERSIST_VERSION}），拒绝启动以防错账`);
+    }
+    for (const col of ["plans", "enrollments", "executions", "settlements"]) {
+      if (!Array.isArray(data[col])) throw new Error(`DR 台账快照 ${persistFile} 缺少 ${col}，拒绝启动`);
+    }
+    planSeq = Number(data.planSeq) || 0;
+    plans.clear(); enrollments.clear(); executions.clear(); settlements.clear();
+    for (const p of data.plans) plans.set(p.id, p);
+    for (const { key, value } of data.enrollments) enrollments.set(key, value);
+    for (const { key, value } of data.executions) executions.set(key, value);
+    for (const { key, value } of data.settlements) settlements.set(key, value);
+  }
+
+  load();
+
+  // 供运维确认台账是否已落盘（/api/dr/persistence）
+  function persistenceInfo() {
+    let savedAt = null;
+    let size = null;
+    if (persistFile) {
+      try {
+        const raw = fs.readFileSync(persistFile, "utf8");
+        size = Buffer.byteLength(raw);
+        savedAt = (JSON.parse(raw).saved_at) || null;
+      } catch (e) { /* 尚未写盘 */ }
+    }
+    return {
+      enabled: !!persistFile,
+      file: persistFile || null,
+      last_saved_at: savedAt,
+      size_bytes: size,
+      plans: plans.size,
+      enrollments: enrollments.size,
+      executions: executions.size,
+      settlements: settlements.size,
+    };
+  }
 
   function planKeyOf(ev) {
     return `${ev.year || ev.monthYear}-${ev.month}-p${ev.planId}`;
@@ -214,6 +317,7 @@ function createStore() {
       created_at: new Date().toISOString(),
     };
     plans.set(id, plan);
+    persist();
     return publicPlan(plan);
   }
 
@@ -245,6 +349,7 @@ function createStore() {
     for (const en of enrollments.values()) {
       if (en.planId === planId && en.status === "enrolled") en.status = "revoked";
     }
+    persist();
     return publicPlan(plan);
   }
 
@@ -257,6 +362,7 @@ function createStore() {
     if (enrollments.has(k)) return enrollments.get(k);
     const en = { homeId, planId, status: "enrolled", at: new Date().toISOString() };
     enrollments.set(k, en);
+    persist();
     return { ...en };
   }
   function unenroll(homeId, planId) {
@@ -264,6 +370,7 @@ function createStore() {
     const en = enrollments.get(k);
     if (!en) return { homeId, planId, status: "none" };
     en.status = "withdrawn";
+    persist();
     return { ...en };
   }
   function isEnrolled(homeId, planId) {
@@ -317,16 +424,22 @@ function createStore() {
     const existed = executions.get(k);
     if (existed) return { record: existed, reused: true };
     executions.set(k, rec);
+    persist();
     return { record: rec, reused: false };
   }
 
   function settle(key, record) {
     if (settlements.has(key)) return { record: settlements.get(key), reused: true };
     settlements.set(key, record);
+    persist();
     return { record, reused: false };
   }
   function getSettlement(key) {
     return settlements.get(key) || null;
+  }
+  // 月账单链路的结算键：与 settleMonthDay 中的键规则一致
+  function getMonthSettlement(homeId, monthKey, ev) {
+    return settlements.get(monthSettleKey(homeId, monthKey, ev)) || null;
   }
 
   // 月度账单视角：该家庭当月所有事件（含已撤销/已退出/失败/已结算）的执行视图
@@ -364,12 +477,14 @@ function createStore() {
     enroll, unenroll, isEnrolled, listEnrollments,
     activeEventMap, monthlyEvents, findDayEvent,
     getExecution, freezeExecution,
-    settle, getSettlement,
+    settle, getSettlement, getMonthSettlement,
+    persistenceInfo,
   };
 }
 
-// 单例台账（进程内持久，随服务生命周期）
-const store = createStore();
+// 单例台账：显式持久化到 data/dr-store.json，服务重启后恢复；
+// 可用环境变量 DR_STORE_FILE 覆盖快照路径（测试/多实例部署用）。
+const store = createStore({ persistFile: process.env.DR_STORE_FILE || DEFAULT_STORE_FILE });
 
 // 执行一次 DR 事件（运营方/家庭预演或事件结算用）：
 //   - 同一 (home, event) 重复执行返回首次冻结结果，不重复结算；
@@ -443,7 +558,7 @@ function runEvent(homeId, input, storeIn) {
 //     否则按月链路测算结果入账，同一月账单重跑只回读同一笔。
 function settleMonthDay(S, homeId, monthKey, day, ctx, m) {
   const ev = ctx.ev;
-  const idemKey = `month:${monthKey}:${homeId}:${ev.eventKey}`;
+  const idemKey = monthSettleKey(homeId, monthKey, ev);
   const prev = S.getSettlement(idemKey);
   if (prev) return { ...prev.result, idempotent: true };
 
@@ -497,4 +612,6 @@ module.exports = {
   windowScenario,
   runEvent,
   settleMonthDay,
+  DEFAULT_STORE_FILE,
+  PERSIST_VERSION,
 };

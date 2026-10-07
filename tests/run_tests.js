@@ -1,5 +1,8 @@
 "use strict";
 const assert = require("assert");
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
 const tariff = require("../engine/tariff");
 const solar = require("../engine/solar");
 const loads = require("../engine/loads");
@@ -388,8 +391,47 @@ t("DR 月度：事件日联动真实购电曲线，日明细含 DR 标记", () =
   assert(d.kwh_buy_bat !== dOther.kwh_buy_bat);
 });
 
-t("DR 撤销：未执行事件不联动不结算；已结算事件金额保留", () => {
+t("DR 撤销：月账单已结算后再撤销，重跑账单不回滚奖励且金额逐分一致", () => {
   const s = dr.createStore();
+  s.publishPlan({ id: "p", name: "T", year: 2026, month: 7, days: [22], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  s.enroll("h", "p");
+  const b1 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+  const e1 = b1.dr.events.find(x => x.day === 22);
+  assert.strictEqual(e1.status, "settled");
+  assert(e1.reward > 0);
+  s.revokePlan("p"); // 出账后才撤销
+  const b2 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+  const e2 = b2.dr.events.find(x => x.day === 22);
+  assert.strictEqual(e2.status, "settled");
+  assert.strictEqual(e2.reward, e1.reward);
+  assert.strictEqual(e2.idempotent, true);
+  assert.strictEqual(b2.dr_reward, b1.dr_reward);
+  // 联动日的真实购电曲线也是事实：能量电费与阶梯逐分不漂移
+  assert.strictEqual(b2.energy_bat, b1.energy_bat);
+  assert.strictEqual(b2.tier_surcharge_bat, b1.tier_surcharge_bat);
+  assert.strictEqual(b2.cost_bat, b1.cost_bat);
+  // 再跑一次仍稳定（撤销状态不会反复改变结果）
+  const b3 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+  assert.strictEqual(b3.dr_reward, b1.dr_reward);
+});
+
+t("DR 退出：月账单已结算后再退出，重跑账单不回滚奖励", () => {
+  const s = dr.createStore();
+  s.publishPlan({ id: "p", name: "T", year: 2026, month: 7, days: [22], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  s.enroll("h", "p");
+  const b1 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+  const reward = b1.dr_reward;
+  assert(reward > 0);
+  s.unenroll("h", "p"); // 出账后退出
+  const b2 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+  const e2 = b2.dr.events.find(x => x.day === 22);
+  assert.strictEqual(e2.status, "settled");
+  assert.strictEqual(e2.reward, b1.dr.events.find(x => x.day === 22).reward);
+  assert.strictEqual(b2.dr_reward, reward);
+  assert.strictEqual(b2.energy_bat, b1.energy_bat);
+});
+
+t("DR 撤销：未执行事件不联动不结算；已结算事件金额保留", () => {  const s = dr.createStore();
   s.publishPlan({ id: "p", name: "T", month: 7, days: [15, 20], events: [
     { type: "fill", start: 0, end: 6, incentive: 0.4 },
     { type: "fill", start: 0, end: 6, incentive: 0.4 },
@@ -495,6 +537,166 @@ t("DR 计划：日期超出月份天数（含闰年）拒绝", () => {
   assert.throws(() => s.publishPlan({ name: "t", month: 2, days: [29], events: [{ type: "peak", start: 18, end: 21, incentive: 1 }] }));
   s.publishPlan({ id: "leap", name: "t", year: 2024, month: 2, days: [29], events: [{ type: "peak", start: 18, end: 21, incentive: 1 }] });
   assert.throws(() => s.publishPlan({ name: "t", month: 4, days: [31], events: [{ type: "peak", start: 18, end: 21, incentive: 1 }] }));
+});
+
+// ========================= DR 台账持久化 / 重启恢复 =========================
+
+let persistTestSeq = 0;
+function tmpStoreFile() {
+  persistTestSeq += 1;
+  return path.join(os.tmpdir(), `dr-store-test-${process.pid}-${persistTestSeq}.json`);
+}
+
+t("DR 持久化：发布/报名/执行/月账单逐笔落盘，重启后完整恢复且不重复结算", () => {
+  const file = tmpStoreFile();
+  const s = dr.createStore({ persistFile: file });
+  s.publishPlan({ id: "p", name: "T", year: 2026, month: 7, days: [15], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  s.enroll("h", "p");
+  const ex = dr.runEvent("h", { planId: "p", day: 15, household: DR_HOUSEHOLD }, s);
+  const bill = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+
+  // 快照文件存在且结构合法
+  const snap = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.strictEqual(snap.version, dr.PERSIST_VERSION);
+  assert.strictEqual(snap.plans.length, 1);
+  assert(snap.settlements.length >= 2); // exec 冻结键 + month 账期键
+  const settleCountAfterFirstBill = s.persistenceInfo().settlements;
+
+  // 模拟服务重启：新建同路径台账，所有记录原样恢复
+  const s2 = dr.createStore({ persistFile: file });
+  const info = s2.persistenceInfo();
+  assert.strictEqual(info.enabled, true);
+  assert.strictEqual(info.plans, 1);
+  assert.strictEqual(info.enrollments, 1);
+  assert.strictEqual(info.executions, 1);
+  assert.strictEqual(info.settlements, settleCountAfterFirstBill);
+  assert.strictEqual(s2.isEnrolled("h", "p"), true);
+  assert.strictEqual(s2.listPlans()[0].status, "published");
+
+  // 重复执行命中冻结记录：回读首笔，不产生第二笔结算
+  const ex2 = dr.runEvent("h", { planId: "p", day: 15, household: { ...DR_HOUSEHOLD, battery: { ...DR_HOUSEHOLD.battery, soc0: 0 } } }, s2);
+  assert.strictEqual(ex2.idempotent, true);
+  assert.strictEqual(ex2.reward, ex.reward);
+  assert.strictEqual(ex2.responded_kwh, ex.responded_kwh);
+
+  // 重跑月账单：金额、旧账单能量电费逐分一致，全部回读，结算表条数不增长
+  const bill2 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s2 });
+  assert.strictEqual(bill2.dr_reward, bill.dr_reward);
+  assert.strictEqual(bill2.cost_bat, bill.cost_bat);
+  assert.strictEqual(bill2.energy_bat, bill.energy_bat);
+  assert.strictEqual(bill2.tier_surcharge_bat, bill.tier_surcharge_bat);
+  assert(bill2.dr.events.every(e => e.idempotent));
+  assert.strictEqual(s2.persistenceInfo().settlements, settleCountAfterFirstBill);
+  // 事件台账视图也能恢复（已结算状态与金额）
+  const ev = s2.monthlyEvents("h", 2026, 7).find(e => e.day === 15);
+  assert.strictEqual(ev.status, "settled");
+  assert.strictEqual(ev.reward, ex.reward);
+});
+
+t("DR 持久化：撤销状态重启后保留——未执行事件仍作废、已结算金额不回滚", () => {
+  const file = tmpStoreFile();
+  const s = dr.createStore({ persistFile: file });
+  s.publishPlan({ id: "p", name: "T", year: 2026, month: 7, days: [15, 20], events: [
+    { type: "fill", start: 0, end: 6, incentive: 0.4 },
+    { type: "fill", start: 0, end: 6, incentive: 0.4 },
+  ]});
+  s.enroll("h", "p");
+  const ex = dr.runEvent("h", { planId: "p", day: 15, household: DR_HOUSEHOLD }, s);
+  s.revokePlan("p");
+  const bill = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s });
+  const settleTotal = s.persistenceInfo().settlements;
+
+  const s2 = dr.createStore({ persistFile: file }); // 重启
+  assert.strictEqual(s2.listPlans()[0].status, "revoked");
+  assert.strictEqual(s2.isEnrolled("h", "p"), false);
+  assert.throws(() => s2.enroll("h2", "p")); // 撤销计划重启后仍不可报名
+  const bill2 = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s2 });
+  const d15 = bill2.dr.events.find(e => e.day === 15);
+  const d20 = bill2.dr.events.find(e => e.day === 20);
+  assert.strictEqual(d15.status, "settled");
+  assert.strictEqual(d15.reward, ex.reward); // 已结算不回滚
+  assert.strictEqual(d20.status, "revoked");
+  assert.strictEqual(d20.reward, 0);
+  assert.strictEqual(bill2.dr_reward, bill.dr_reward);
+  assert.strictEqual(s2.persistenceInfo().settlements, settleTotal); // 无新增结算
+});
+
+t("DR 持久化：失败记录重启后仍冻结，不会补结成功", () => {
+  const file = tmpStoreFile();
+  const s = dr.createStore({ persistFile: file });
+  s.publishPlan({ id: "p", name: "T", year: 2026, month: 7, days: [15], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  s.enroll("h", "p");
+  const f = dr.runEvent("h", { planId: "p", day: 15, household: DR_HOUSEHOLD, telemetryFault: true }, s);
+  assert.strictEqual(f.status, "failed");
+
+  const s2 = dr.createStore({ persistFile: file }); // 重启后重试
+  const f2 = dr.runEvent("h", { planId: "p", day: 15, household: DR_HOUSEHOLD }, s2);
+  assert.strictEqual(f2.status, "failed");
+  assert.strictEqual(f2.idempotent, true);
+  assert.strictEqual(f2.reward, 0);
+  const m = sim.monthBill({ ...DR_HOUSEHOLD, year: 2026, month: 7, days: 30, homeId: "h", drStore: s2 });
+  assert.strictEqual(m.dr.failed_count, 1);
+  assert.strictEqual(m.dr_reward, 0);
+});
+
+t("DR 持久化：每次变更即时落盘，写入中途重启不丢已提交记录", () => {
+  const file = tmpStoreFile();
+  const s = dr.createStore({ persistFile: file });
+  s.publishPlan({ id: "p1", name: "T1", year: 2026, month: 7, days: [15], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  // 刚发布就"重启"：后面尚未发生的操作一条都没有，但已提交的计划在
+  let mid = dr.createStore({ persistFile: file });
+  assert.strictEqual(mid.listPlans().length, 1);
+  assert.strictEqual(mid.persistenceInfo().enrollments, 0);
+  s.enroll("h", "p1");
+  mid = dr.createStore({ persistFile: file });
+  assert.strictEqual(mid.isEnrolled("h", "p1"), true);
+  assert.strictEqual(mid.persistenceInfo().executions, 0);
+  const ex = dr.runEvent("h", { planId: "p1", day: 15, household: DR_HOUSEHOLD }, s);
+  mid = dr.createStore({ persistFile: file });
+  const exRead = dr.runEvent("h", { planId: "p1", day: 15, household: DR_HOUSEHOLD }, mid);
+  assert.strictEqual(exRead.idempotent, true);
+  assert.strictEqual(exRead.reward, ex.reward);
+});
+
+t("DR 持久化：自增 planSeq 跨重启恢复，自动生成的计划 ID 不与旧记录撞号", () => {
+  const file = tmpStoreFile();
+  const s = dr.createStore({ persistFile: file });
+  const p = s.publishPlan({ name: "T", year: 2026, month: 7, days: [15], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  assert.strictEqual(p.id, "plan-2026-07-1");
+  const s2 = dr.createStore({ persistFile: file }); // 重启
+  const p2 = s2.publishPlan({ name: "T2", year: 2026, month: 7, days: [16], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  assert.strictEqual(p2.id, "plan-2026-07-2");
+  // 与已恢复计划同名 ID 仍然拒绝（不会被当成新记录覆盖）
+  assert.throws(() => s2.publishPlan({ id: "plan-2026-07-1", name: "T3", year: 2026, month: 7, days: [17], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] }));
+});
+
+t("DR 持久化：快照损坏时拒绝启动并保留原文件，绝不静默清空", () => {
+  const file = tmpStoreFile();
+  const s = dr.createStore({ persistFile: file });
+  s.publishPlan({ id: "p", name: "T", year: 2026, month: 7, days: [15], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  const rawBefore = fs.readFileSync(file, "utf8");
+  fs.writeFileSync(file, "{ 这不是合法 JSON");
+  assert.throws(() => dr.createStore({ persistFile: file }), /损坏/);
+  // 原损坏文件保留在原处供人工核对，没有被空台账覆盖
+  assert.strictEqual(fs.readFileSync(file, "utf8"), "{ 这不是合法 JSON");
+  assert(rawBefore.includes('"id":"p"')); // 确认此前确有有效快照
+});
+
+t("DR 持久化：快照版本不符拒绝启动（防止按新/旧结构错账）", () => {
+  const file = tmpStoreFile();
+  fs.writeFileSync(file, JSON.stringify({ kind: "home-energy-dr-store", version: 9999, plans: [], enrollments: [], executions: [], settlements: [] }));
+  assert.throws(() => dr.createStore({ persistFile: file }), /版本或类型不符/);
+});
+
+t("DR 持久化：缺省（测试/嵌入）为纯内存台账，不产生任何文件", () => {
+  const file = tmpStoreFile();
+  // 不传 persistFile 即纯内存；persistFile:false 显式表达同义
+  for (const opt of [undefined, { persistFile: false }]) {
+    const s = opt ? dr.createStore(opt) : dr.createStore();
+    assert.strictEqual(s.persistenceInfo().enabled, false);
+    s.publishPlan({ id: `m${Math.random()}`, name: "T", year: 2026, month: 7, days: [15], events: [{ type: "fill", start: 0, end: 6, incentive: 0.4 }] });
+  }
+  assert.strictEqual(fs.existsSync(file), false);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
